@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 
 # models & large artifacts
-*.pkl
+#*.pkl
 *.npz
 *.npy
 *.pt
