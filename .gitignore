@@ -1,0 +1,21 @@
+# venv, cache, system
+.venv/
+__pycache__/
+*.pyc
+
+# models & large artifacts
+*.pkl
+*.npz
+*.npy
+*.pt
+*.h5
+
+# data dumps (keep small CSVs only if needed)
+data/*.parquet
+data/*.feather
+data/*.pickle
+data/*.zip
+
+# secrets
+firebase_key.json
+.env

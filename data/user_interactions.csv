@@ -1,0 +1,15 @@
+user_id,track_id,interaction_type,timestamp
+user_1,16zol4GvHyTER5irYODUk0,play,2025-10-21 10:02:00
+user_1,4tZwfgrHOc3mvqYlEYSvVi,like,2025-10-21 10:10:00
+user_2,7ouMYWpwJ422jRcDASZB7P,play,2025-10-21 11:30:00
+user_2,3AJwUDP919kvQ9QcozQPxg,skip,2025-10-21 11:31:00
+user_3,0eGsygTp906u18L0Oimnem,like,2025-10-21 12:00:00
+user_3,1zB4vmk8tFRmM9UULNzbLB,play,2025-10-21 12:12:00
+user_4,5ChkMS8OtdzJeqyybCc9R5,play,2025-10-21 12:40:00
+user_5,3KkXRkHbMCARz0aVfEt68P,like,2025-10-21 13:05:00
+user_6,2takcwOaAZWiXQijPHIx7B,play,2025-10-21 14:00:00
+user_7,4VqPOruhp5EdPBeR92t6lQ,play,2025-10-21 15:20:00
+user_8,16zol4GvHyTER5irYODUk0,play,2025-10-21 15:35:00
+user_9,4tZwfgrHOc3mvqYlEYSvVi,like,2025-10-21 16:00:00
+user_10,7ouMYWpwJ422jRcDASZB7P,play,2025-10-21 17:00:00
+user_10,3AJwUDP919kvQ9QcozQPxg,like,2025-10-21 17:02:00

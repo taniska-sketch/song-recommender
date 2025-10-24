@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🎵 Song Recommender</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: linear-gradient(120deg, #89f7fe, #66a6ff);
+      text-align: center;
+      padding: 40px;
+      color: #222;
+    }
+    h1 {
+      color: #003366;
+      margin-bottom: 20px;
+    }
+    input, button {
+      padding: 10px;
+      font-size: 16px;
+      border-radius: 6px;
+      border: 1px solid #333;
+      margin: 5px;
+    }
+    button {
+      background-color: #ff8c00;
+      color: white;
+      border: none;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+    button:hover {
+      background-color: #e67e22;
+    }
+    #results {
+      margin-top: 25px;
+      text-align: left;
+      display: inline-block;
+      background: #fff;
+      border-radius: 10px;
+      padding: 20px;
+      width: 60%;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+    }
+    .song {
+      padding: 8px 0;
+      border-bottom: 1px solid #ddd;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎵 Content-Based Song Recommender</h1>
+  <p>Enter a <b>Track ID</b> and get similar songs!</p>
+  <input type="text" id="trackId" placeholder="Enter Track ID">
+  <input type="number" id="num" value="5" min="1" max="10">
+  <button onclick="getRecommendations()">Get Recommendations</button>
+
+  <div id="results"></div>
+
+  <script>
+    async function getRecommendations() {
+      const trackId = document.getElementById('trackId').value;
+      const n = document.getElementById('num').value;
+      const apiUrl = `/recommend?track_id=${trackId}&n=${n}`;
+      const response = await fetch(apiUrl);
+      const data = await response.json();
+
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = "<h3>Recommended Songs:</h3>";
+
+      if (data.recommendations && data.recommendations.length > 0) {
+        data.recommendations.forEach(song => {
+          const item = document.createElement('div');
+          item.classList.add('song');
+          item.innerHTML = `<b>${song.track_name}</b> — ${song.artist_name}`;
+          resultsDiv.appendChild(item);
+        });
+      } else {
+        resultsDiv.innerHTML += "<p>No recommendations found.</p>";
+      }
+    }
+  </script>
+</body>
+</html>
