@@ -1,12 +1,9 @@
 # ----------------------------------------------------------------------------------
 # HYBRID RECOMMENDATION API (FastAPI)
-# Blends Content-Based (CB) and Collaborative Filtering (CF) scores for a final result.
+# Loads model artifacts from Google Drive (Render-friendly)
 # ----------------------------------------------------------------------------------
 
-import os
-import pandas as pd
-import numpy as np
-import joblib
+import os, io, requests, shutil, joblib, pandas as pd, numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Any
@@ -15,95 +12,91 @@ from firebase_admin import credentials, firestore
 from fastapi.responses import JSONResponse
 
 # ------------------------------------------------------
-# 1️⃣ Initialize Firebase connection
+# 1️⃣ Firebase initialization
 # ------------------------------------------------------
 try:
-    firebase_key_path = os.path.join(os.getcwd(), ".firebase_key.json")  # ✅ Correct for Render
+    firebase_key_path = os.path.join(os.getcwd(), "firebase_key.json")
     cred = credentials.Certificate(firebase_key_path)
     firebase_admin.initialize_app(cred)
     db = firestore.client()
     print("✅ Firebase initialized successfully.")
 except Exception as e:
     print(f"⚠️ Firebase initialization failed: {e}")
-    db = None  # fallback
+    db = None
 
 # ------------------------------------------------------
-# 2️⃣ FastAPI app configuration
+# 2️⃣ FastAPI app config
 # ------------------------------------------------------
-app = FastAPI(
-    title="Hybrid Spotify Recommender API",
-    description="Blends Content-Based and Collaborative Filtering models to suggest songs.",
-    version="1.0.2"
-)
+app = FastAPI(title="Hybrid Spotify Recommender API", version="1.0.2")
 
 # ------------------------------------------------------
-# 3️⃣ Required metadata columns
+# 3️⃣ Google Drive helper functions
 # ------------------------------------------------------
-METADATA_COLS_REQUIRED = ['track_id', 'track_name', 'artist_name']
+def download_from_gdrive(url: str, dest: str):
+    print(f"📥 Downloading {os.path.basename(dest)} from Drive...")
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(r.raw, f)
+    print(f"✅ Saved {dest}")
+    return dest
+
+def ensure_artifacts():
+    os.makedirs("artifacts", exist_ok=True)
+    files = {
+        "content_similarity.pkl": os.getenv("GDRIVE_CONTENT_URL", "https://drive.google.com/uc?export=download&id=1b2EYpS7eGY1M9bBv3iCS7JVubwKpoO6F"),
+        "item_similarity_cf_matrix.pkl": os.getenv("GDRIVE_CF_URL", "https://drive.google.com/uc?export=download&id=1RnTh7VuPdGQl2yyct1rZp_ttzLSInY8k"),
+        "scaler.pkl": os.getenv("GDRIVE_SCALER_URL", "https://drive.google.com/uc?export=download&id=1Hyxort42wZddkLJa_pyJtCygM4XvC5k4"),
+        "user_item_matrix.pkl": os.getenv("GDRIVE_USERITEM_URL", "https://drive.google.com/uc?export=download&id=1rmHTgcvsnDfH9SE1kmTpPlpAyv6naloc"),
+    }
+    paths = {}
+    for name, url in files.items():
+        local_path = f"artifacts/{name}"
+        if not os.path.exists(local_path):
+            download_from_gdrive(url, local_path)
+        paths[name] = local_path
+    return paths
 
 # ------------------------------------------------------
-# 4️⃣ Load all model and data artifacts
+# 4️⃣ Load models and data
 # ------------------------------------------------------
 try:
-    # --- Content-Based (CB) Artifacts ---
-    CONTENT_SIMILARITY_MATRIX = joblib.load('content_similarity.pkl')
-    SCALED_FEATURES = pd.read_csv('scaled_feature_sample.csv')
-    SCALER = joblib.load('scaler.pkl')
+    paths = ensure_artifacts()
+    CONTENT_SIMILARITY_MATRIX = joblib.load(paths["content_similarity.pkl"])
+    CF_SIMILARITY_MATRIX = joblib.load(paths["item_similarity_cf_matrix.pkl"])
+    SCALER = joblib.load(paths["scaler.pkl"])
+    USER_ITEM_MATRIX = joblib.load(paths["user_item_matrix.pkl"])
+    SCALED_FEATURES = pd.read_csv("scaled_feature_sample.csv")
 
-    # --- Collaborative Filtering (CF) Artifacts ---
-    CF_SIMILARITY_MATRIX = joblib.load('item_similarity_cf_matrix.pkl')
-    USER_ITEM_MATRIX = joblib.load('user_item_matrix.pkl')
-
-    # --- Firestore Data Load ---
-    try:
-        if db:
-            songs_ref = db.collection("songs").stream()
-            songs_data = [{**doc.to_dict()} for doc in songs_ref]
-            METADATA = pd.DataFrame(songs_data)
-
-            if not METADATA.empty:
-                METADATA = METADATA.rename(columns={
-                    "title": "track_name",
-                    "artist": "artist_name",
-                    "url": "track_id",
-                    "category": "genre"
-                })
-                print(f"✅ Loaded {len(METADATA)} songs from Firestore.")
-            else:
-                raise ValueError("No data in Firestore.")
-        else:
-            raise ConnectionError("Firebase not available.")
-    except Exception as e:
-        print(f"⚠️ Firebase load failed: {e}")
-        METADATA = pd.read_csv('SpotifyFeatures.csv')
-        print(f"📁 Loaded {len(METADATA)} songs from local CSV instead.")
-
-    # --- Validation ---
-    METADATA.columns = [col.lower() for col in METADATA.columns]
-    missing = [c for c in METADATA_COLS_REQUIRED if c not in METADATA.columns]
-    if missing:
-        raise KeyError(f"Metadata missing columns: {missing}")
-
-    USER_ITEM_MATRIX.columns = USER_ITEM_MATRIX.columns.astype(str)
-    SCALED_FEATURES['track_id'] = SCALED_FEATURES['track_id'].astype(str)
-    METADATA['track_id'] = METADATA['track_id'].astype(str)
-
-    TRACK_TO_CF_INDEX = {track: i for i, track in enumerate(USER_ITEM_MATRIX.columns)}
-    CB_INDICES = pd.Series(SCALED_FEATURES.index, index=SCALED_FEATURES['track_id'])
-    GUARANTEED_CB_TRACK_ID = SCALED_FEATURES['track_id'].iloc[0]
-
-    print("--- HYBRID API LOADED SUCCESSFULLY ---")
-    print(f"CB Matrix Shape: {CONTENT_SIMILARITY_MATRIX.shape}")
-    print(f"CF Matrix Shape: {CF_SIMILARITY_MATRIX.shape}")
-    print(f"Sample Track ID: {GUARANTEED_CB_TRACK_ID}")
-
+    print("✅ All models loaded successfully from Google Drive!")
 except Exception as e:
-    print("❌ FATAL ERROR: Failed to load one or more artifacts or data.")
-    print(f"Error details: {e}")
+    print(f"❌ Model load failed: {e}")
     exit(1)
 
 # ------------------------------------------------------
-# 5️⃣ Input schema
+# 5️⃣ Metadata load (Firebase or local)
+# ------------------------------------------------------
+try:
+    if db:
+        docs = db.collection("songs").stream()
+        data = [d.to_dict() for d in docs]
+        METADATA = pd.DataFrame(data)
+        METADATA.rename(columns={"title": "track_name", "artist": "artist_name", "url": "track_id"}, inplace=True)
+        print(f"✅ Loaded {len(METADATA)} songs from Firestore.")
+    else:
+        raise Exception("Firestore unavailable")
+except Exception:
+    METADATA = pd.read_csv("SpotifyFeatures.csv")
+    print(f"📁 Loaded {len(METADATA)} songs from local CSV.")
+
+METADATA_COLS_REQUIRED = ["track_id", "track_name", "artist_name"]
+METADATA["track_id"] = METADATA["track_id"].astype(str)
+
+TRACK_TO_CF_INDEX = {track: i for i, track in enumerate(USER_ITEM_MATRIX.columns)}
+CB_INDICES = pd.Series(SCALED_FEATURES.index, index=SCALED_FEATURES["track_id"])
+
+# ------------------------------------------------------
+# 6️⃣ Input schema
 # ------------------------------------------------------
 class RecommendationRequest(BaseModel):
     track_id: str
@@ -111,85 +104,40 @@ class RecommendationRequest(BaseModel):
     top_n: int = 10
 
 # ------------------------------------------------------
-# 6️⃣ Content-Based Recommendation
+# 7️⃣ Recommender logic
 # ------------------------------------------------------
 def get_cb_recommendations(track_id, top_n=10):
     if track_id not in CB_INDICES.index:
         return {}
     idx = CB_INDICES[track_id]
-    sim_scores = list(enumerate(CONTENT_SIMILARITY_MATRIX[idx]))
-    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:top_n+1]
-    track_indices = [i[0] for i in sim_scores]
-    track_scores = [i[1] for i in sim_scores]
-    cb_tracks = SCALED_FEATURES.iloc[track_indices]['track_id'].tolist()
-    return dict(zip(cb_tracks, track_scores))
+    scores = list(enumerate(CONTENT_SIMILARITY_MATRIX[idx]))
+    scores = sorted(scores, key=lambda x: x[1], reverse=True)[1 : top_n + 1]
+    tracks = SCALED_FEATURES.iloc[[i[0] for i in scores]]["track_id"].tolist()
+    return dict(zip(tracks, [i[1] for i in scores]))
 
-# ------------------------------------------------------
-# 7️⃣ Collaborative Filtering Recommendation
-# ------------------------------------------------------
 def get_cf_recommendations(user_id, track_id, top_n=10):
     if user_id not in USER_ITEM_MATRIX.index or track_id not in TRACK_TO_CF_INDEX:
         return {}
-    track_cf_index = TRACK_TO_CF_INDEX[track_id]
-    sim_scores = CF_SIMILARITY_MATRIX[track_cf_index]
-    sim_scores_paired = sorted(list(enumerate(sim_scores)), key=lambda x: x[1], reverse=True)[1:]
-    top_indices = [i[0] for i in sim_scores_paired[:top_n*2]]
-    top_scores = [i[1] for i in sim_scores_paired[:top_n*2]]
-    cf_tracks = [USER_ITEM_MATRIX.columns[idx] for idx in top_indices]
-    return dict(zip(cf_tracks, top_scores))
+    idx = TRACK_TO_CF_INDEX[track_id]
+    sims = CF_SIMILARITY_MATRIX[idx]
+    pairs = sorted(list(enumerate(sims)), key=lambda x: x[1], reverse=True)[1:]
+    top = pairs[: top_n * 2]
+    tracks = [USER_ITEM_MATRIX.columns[i[0]] for i in top]
+    return dict(zip(tracks, [i[1] for i in top]))
 
-# ------------------------------------------------------
-# 8️⃣ Hybrid Recommendation Endpoint
-# ------------------------------------------------------
-@app.post("/recommend_hybrid", response_model=List[Dict[str, Any]])
-def recommend_hybrid(request: RecommendationRequest):
-    cb_scores = get_cb_recommendations(request.track_id, request.top_n*2)
-    cf_scores = get_cf_recommendations(request.user_id, request.track_id, request.top_n*2)
-    df_cb = pd.DataFrame(list(cb_scores.items()), columns=['track_id', 'cb_score'])
-    df_cf = pd.DataFrame(list(cf_scores.items()), columns=['track_id', 'cf_score'])
-    df_cb['track_id'] = df_cb['track_id'].astype(str)
-    df_cf['track_id'] = df_cf['track_id'].astype(str)
-    combined_df = pd.merge(df_cb, df_cf, on='track_id', how='outer').fillna(0)
-    combined_df['hybrid_score'] = (combined_df['cb_score'] * 0.4) + (combined_df['cf_score'] * 0.6)
-    final_df = combined_df[combined_df['track_id'] != request.track_id]
-    final_df = final_df.sort_values(by='hybrid_score', ascending=False).drop_duplicates(subset=['track_id']).head(request.top_n)
-    result_df = pd.merge(final_df, METADATA[METADATA_COLS_REQUIRED], on='track_id', how='left')
+@app.post("/recommend_hybrid")
+def recommend_hybrid(req: RecommendationRequest):
+    cb = get_cb_recommendations(req.track_id, req.top_n * 2)
+    cf = get_cf_recommendations(req.user_id, req.track_id, req.top_n * 2)
+    df = pd.merge(
+        pd.DataFrame(cb.items(), columns=["track_id", "cb_score"]),
+        pd.DataFrame(cf.items(), columns=["track_id", "cf_score"]),
+        on="track_id", how="outer").fillna(0)
+    df["hybrid_score"] = df["cb_score"] * 0.4 + df["cf_score"] * 0.6
+    df = df[df["track_id"] != req.track_id].sort_values("hybrid_score", ascending=False).head(req.top_n)
+    merged = pd.merge(df, METADATA, on="track_id", how="left")
+    return merged.to_dict(orient="records")
 
-    results = result_df.apply(lambda row: {
-        "track_id": row['track_id'],
-        "track_name": row['track_name'],
-        "artist_name": row['artist_name'],
-        "hybrid_score": round(row['hybrid_score'], 4)
-    }, axis=1).tolist()
-
-    if not results:
-        fallback = METADATA.sample(n=request.top_n, random_state=42)
-        results = fallback.apply(lambda row: {
-            "track_id": row['track_id'],
-            "track_name": row['track_name'],
-            "artist_name": row['artist_name'],
-            "hybrid_score": 0.0
-        }, axis=1).tolist()
-    return results
-
-# ------------------------------------------------------
-# 9️⃣ Health Check
-# ------------------------------------------------------
 @app.get("/health")
-def health_check():
-    return {"status": "ok", "models_loaded": "Hybrid CB+CF"}
+def health(): return {"status": "ok", "models": "Hybrid CB+CF from Google Drive"}
 
-# ------------------------------------------------------
-# 🔟 Unified Data Endpoint
-# ------------------------------------------------------
-@app.get("/all_data")
-def get_all_data():
-    try:
-        if db:
-            songs_ref = db.collection("songs").stream()
-            songs_data = [{**doc.to_dict()} for doc in songs_ref]
-            return JSONResponse(content={"songs": songs_data})
-        else:
-            return JSONResponse(content={"songs": METADATA.to_dict(orient="records")})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
