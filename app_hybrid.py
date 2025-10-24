@@ -3,6 +3,7 @@
 # Blends Content-Based (CB) and Collaborative Filtering (CF) scores for a final result.
 # ----------------------------------------------------------------------------------
 
+import os
 import pandas as pd
 import numpy as np
 import joblib
@@ -16,9 +17,15 @@ from fastapi.responses import JSONResponse
 # ------------------------------------------------------
 # 1️⃣ Initialize Firebase connection
 # ------------------------------------------------------
-cred = credentials.Certificate("C:/Users/tanis/OneDrive/Documents/songrecommender/firebase_key.json")
-firebase_admin.initialize_app(cred)
-db = firestore.client()
+try:
+    firebase_key_path = os.path.join(os.getcwd(), ".firebase_key.json")  # ✅ Correct for Render
+    cred = credentials.Certificate(firebase_key_path)
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    print("✅ Firebase initialized successfully.")
+except Exception as e:
+    print(f"⚠️ Firebase initialization failed: {e}")
+    db = None  # fallback
 
 # ------------------------------------------------------
 # 2️⃣ FastAPI app configuration
@@ -26,7 +33,7 @@ db = firestore.client()
 app = FastAPI(
     title="Hybrid Spotify Recommender API",
     description="Blends Content-Based and Collaborative Filtering models to suggest songs.",
-    version="1.0.0"
+    version="1.0.2"
 )
 
 # ------------------------------------------------------
@@ -49,33 +56,33 @@ try:
 
     # --- Firestore Data Load ---
     try:
-        songs_ref = db.collection("songs").stream()
-        songs_data = [{**doc.to_dict()} for doc in songs_ref]
-        METADATA = pd.DataFrame(songs_data)
+        if db:
+            songs_ref = db.collection("songs").stream()
+            songs_data = [{**doc.to_dict()} for doc in songs_ref]
+            METADATA = pd.DataFrame(songs_data)
 
-        if not METADATA.empty:
-            # ✅ Map Firestore field names to match recommender schema
-            METADATA = METADATA.rename(columns={
-                "title": "track_name",
-                "artist": "artist_name",
-                "url": "track_id",
-                "category": "genre"
-            })
-            print(f"✅ Loaded {len(METADATA)} songs from Firestore (fields mapped).")
+            if not METADATA.empty:
+                METADATA = METADATA.rename(columns={
+                    "title": "track_name",
+                    "artist": "artist_name",
+                    "url": "track_id",
+                    "category": "genre"
+                })
+                print(f"✅ Loaded {len(METADATA)} songs from Firestore.")
+            else:
+                raise ValueError("No data in Firestore.")
         else:
-            raise ValueError("No data found in Firestore collection 'songs'.")
-
+            raise ConnectionError("Firebase not available.")
     except Exception as e:
-        print(f"⚠️ Firebase load failed, falling back to local CSV.")
-        print(f"Error details: {e}")
+        print(f"⚠️ Firebase load failed: {e}")
         METADATA = pd.read_csv('SpotifyFeatures.csv')
+        print(f"📁 Loaded {len(METADATA)} songs from local CSV instead.")
 
-    # --- CRITICAL VALIDATION AND TYPE CASTING ---
+    # --- Validation ---
     METADATA.columns = [col.lower() for col in METADATA.columns]
-
-    if not all(col in METADATA.columns for col in METADATA_COLS_REQUIRED):
-        missing = [col for col in METADATA_COLS_REQUIRED if col not in METADATA.columns]
-        raise KeyError(f"Metadata missing required columns: {missing}. Found: {list(METADATA.columns)}")
+    missing = [c for c in METADATA_COLS_REQUIRED if c not in METADATA.columns]
+    if missing:
+        raise KeyError(f"Metadata missing columns: {missing}")
 
     USER_ITEM_MATRIX.columns = USER_ITEM_MATRIX.columns.astype(str)
     SCALED_FEATURES['track_id'] = SCALED_FEATURES['track_id'].astype(str)
@@ -88,15 +95,15 @@ try:
     print("--- HYBRID API LOADED SUCCESSFULLY ---")
     print(f"CB Matrix Shape: {CONTENT_SIMILARITY_MATRIX.shape}")
     print(f"CF Matrix Shape: {CF_SIMILARITY_MATRIX.shape}")
-    print(f"*** TEST TRACK ID (Use this!): {GUARANTEED_CB_TRACK_ID} ***")
+    print(f"Sample Track ID: {GUARANTEED_CB_TRACK_ID}")
 
 except Exception as e:
-    print("FATAL ERROR: Failed to load one or more artifacts or validate data.")
+    print("❌ FATAL ERROR: Failed to load one or more artifacts or data.")
     print(f"Error details: {e}")
     exit(1)
 
 # ------------------------------------------------------
-# 5️⃣ Input schema definition
+# 5️⃣ Input schema
 # ------------------------------------------------------
 class RecommendationRequest(BaseModel):
     track_id: str
@@ -144,45 +151,45 @@ def recommend_hybrid(request: RecommendationRequest):
     df_cf['track_id'] = df_cf['track_id'].astype(str)
     combined_df = pd.merge(df_cb, df_cf, on='track_id', how='outer').fillna(0)
     combined_df['hybrid_score'] = (combined_df['cb_score'] * 0.4) + (combined_df['cf_score'] * 0.6)
-    final_recommendations = combined_df[combined_df['track_id'] != request.track_id]
-    final_recommendations = final_recommendations.sort_values(by='hybrid_score', ascending=False)
-    final_recommendations = final_recommendations.drop_duplicates(subset=['track_id']).head(request.top_n)
-    result_df = pd.merge(final_recommendations, METADATA[METADATA_COLS_REQUIRED], on='track_id', how='left')
+    final_df = combined_df[combined_df['track_id'] != request.track_id]
+    final_df = final_df.sort_values(by='hybrid_score', ascending=False).drop_duplicates(subset=['track_id']).head(request.top_n)
+    result_df = pd.merge(final_df, METADATA[METADATA_COLS_REQUIRED], on='track_id', how='left')
 
     results = result_df.apply(lambda row: {
         "track_id": row['track_id'],
         "track_name": row['track_name'],
         "artist_name": row['artist_name'],
-        "popularity": 0,
         "hybrid_score": round(row['hybrid_score'], 4)
     }, axis=1).tolist()
 
     if not results:
-        fallback_sample = METADATA.sample(n=request.top_n, random_state=42)
-        results = fallback_sample.apply(lambda row: {
+        fallback = METADATA.sample(n=request.top_n, random_state=42)
+        results = fallback.apply(lambda row: {
             "track_id": row['track_id'],
             "track_name": row['track_name'],
             "artist_name": row['artist_name'],
-            "popularity": 0,
             "hybrid_score": 0.0
         }, axis=1).tolist()
     return results
 
 # ------------------------------------------------------
-# 9️⃣ Health check endpoint
+# 9️⃣ Health Check
 # ------------------------------------------------------
 @app.get("/health")
 def health_check():
     return {"status": "ok", "models_loaded": "Hybrid CB+CF"}
 
 # ------------------------------------------------------
-# 🔟 Unified data endpoint (optional)
+# 🔟 Unified Data Endpoint
 # ------------------------------------------------------
 @app.get("/all_data")
 def get_all_data():
     try:
-        songs_ref = db.collection("songs").stream()
-        songs_data = [{**doc.to_dict()} for doc in songs_ref]
-        return JSONResponse(content={"songs": songs_data})
+        if db:
+            songs_ref = db.collection("songs").stream()
+            songs_data = [{**doc.to_dict()} for doc in songs_ref]
+            return JSONResponse(content={"songs": songs_data})
+        else:
+            return JSONResponse(content={"songs": METADATA.to_dict(orient="records")})
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
