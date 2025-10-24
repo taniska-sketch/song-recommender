@@ -1,102 +1,105 @@
 # ----------------------------------------------------------------------------------
 # HYBRID RECOMMENDATION API (FastAPI)
-# Loads model artifacts from Google Drive (Render-friendly)
+# Blends Content-Based (CB) and Collaborative Filtering (CF) scores for a final result.
+# Loads model artifacts automatically from Google Drive.
 # ----------------------------------------------------------------------------------
 
-import os, io, requests, shutil, joblib, pandas as pd, numpy as np
+import os
+import requests
+import pandas as pd
+import numpy as np
+import joblib
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Any
-import firebase_admin
-from firebase_admin import credentials, firestore
 from fastapi.responses import JSONResponse
 
 # ------------------------------------------------------
-# 1️⃣ Firebase initialization
+# 1️⃣ Download helper for Google Drive model files
 # ------------------------------------------------------
-try:
-    firebase_key_path = os.path.join(os.getcwd(), "firebase_key.json")
-    cred = credentials.Certificate(firebase_key_path)
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print("✅ Firebase initialized successfully.")
-except Exception as e:
-    print(f"⚠️ Firebase initialization failed: {e}")
-    db = None
+def download_from_gdrive(url, dest_path):
+    """Downloads a file from a direct Google Drive URL if it doesn't exist locally."""
+    if not os.path.exists(dest_path):
+        print(f"⬇️ Downloading {os.path.basename(dest_path)}...")
+        response = requests.get(url, allow_redirects=True)
+        if response.status_code == 200:
+            with open(dest_path, 'wb') as f:
+                f.write(response.content)
+            print(f"✅ Downloaded: {dest_path}")
+        else:
+            raise Exception(f"Failed to download {url}: {response.status_code}")
 
 # ------------------------------------------------------
-# 2️⃣ FastAPI app config
+# 2️⃣ Ensure all model artifacts are available
 # ------------------------------------------------------
-app = FastAPI(title="Hybrid Spotify Recommender API", version="1.0.2")
-
-# ------------------------------------------------------
-# 3️⃣ Google Drive helper functions
-# ------------------------------------------------------
-def download_from_gdrive(url: str, dest: str):
-    print(f"📥 Downloading {os.path.basename(dest)} from Drive...")
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            shutil.copyfileobj(r.raw, f)
-    print(f"✅ Saved {dest}")
-    return dest
-
 def ensure_artifacts():
-    os.makedirs("artifacts", exist_ok=True)
-    files = {
-        "content_similarity.pkl": os.getenv("GDRIVE_CONTENT_URL", "https://drive.google.com/uc?export=download&id=1b2EYpS7eGY1M9bBv3iCS7JVubwKpoO6F"),
-        "item_similarity_cf_matrix.pkl": os.getenv("GDRIVE_CF_URL", "https://drive.google.com/uc?export=download&id=1RnTh7VuPdGQl2yyct1rZp_ttzLSInY8k"),
-        "scaler.pkl": os.getenv("GDRIVE_SCALER_URL", "https://drive.google.com/uc?export=download&id=1Hyxort42wZddkLJa_pyJtCygM4XvC5k4"),
-        "user_item_matrix.pkl": os.getenv("GDRIVE_USERITEM_URL", "https://drive.google.com/uc?export=download&id=1rmHTgcvsnDfH9SE1kmTpPlpAyv6naloc"),
+    os.makedirs("models", exist_ok=True)
+    paths = {
+        "content_similarity.pkl": os.path.join("models", "content_similarity.pkl"),
+        "item_similarity_cf_matrix.pkl": os.path.join("models", "item_similarity_cf_matrix.pkl"),
+        "scaler.pkl": os.path.join("models", "scaler.pkl"),
+        "user_item_matrix.pkl": os.path.join("models", "user_item_matrix.pkl")
     }
-    paths = {}
-    for name, url in files.items():
-        local_path = f"artifacts/{name}"
-        if not os.path.exists(local_path):
-            download_from_gdrive(url, local_path)
-        paths[name] = local_path
+
+    urls = {
+        "content_similarity.pkl": os.getenv("GDRIVE_CONTENT_URL"),
+        "item_similarity_cf_matrix.pkl": os.getenv("GDRIVE_CF_URL"),
+        "scaler.pkl": os.getenv("GDRIVE_SCALER_URL"),
+        "user_item_matrix.pkl": os.getenv("GDRIVE_USERITEM_URL")
+    }
+
+    for key, path in paths.items():
+        if urls[key]:
+            download_from_gdrive(urls[key], path)
+        else:
+            print(f"⚠️ Missing environment variable for {key}")
+
     return paths
 
 # ------------------------------------------------------
-# 4️⃣ Load models and data
+# 3️⃣ Initialize FastAPI app
+# ------------------------------------------------------
+app = FastAPI(
+    title="Hybrid Spotify Recommender API",
+    description="Blends Content-Based and Collaborative Filtering models to suggest songs.",
+    version="2.0.0"
+)
+
+# ------------------------------------------------------
+# 4️⃣ Load model & metadata
 # ------------------------------------------------------
 try:
     paths = ensure_artifacts()
+
     CONTENT_SIMILARITY_MATRIX = joblib.load(paths["content_similarity.pkl"])
     CF_SIMILARITY_MATRIX = joblib.load(paths["item_similarity_cf_matrix.pkl"])
     SCALER = joblib.load(paths["scaler.pkl"])
     USER_ITEM_MATRIX = joblib.load(paths["user_item_matrix.pkl"])
-    SCALED_FEATURES = pd.read_csv("scaled_feature_sample.csv")
 
-    print("✅ All models loaded successfully from Google Drive!")
+    # Load metadata CSV
+    METADATA = pd.read_csv('SpotifyFeatures.csv')
+    METADATA.columns = [c.lower() for c in METADATA.columns]
+    METADATA_COLS_REQUIRED = ['track_id', 'track_name', 'artist_name']
+
+    for c in METADATA_COLS_REQUIRED:
+        if c not in METADATA.columns:
+            raise KeyError(f"Missing column: {c}")
+
+    USER_ITEM_MATRIX.columns = USER_ITEM_MATRIX.columns.astype(str)
+    METADATA['track_id'] = METADATA['track_id'].astype(str)
+
+    CB_INDICES = pd.Series(METADATA.index, index=METADATA['track_id'])
+    TRACK_TO_CF_INDEX = {track: i for i, track in enumerate(USER_ITEM_MATRIX.columns)}
+
+    print("✅ All model artifacts loaded successfully.")
+
 except Exception as e:
-    print(f"❌ Model load failed: {e}")
+    print("❌ FATAL ERROR: Failed to load model artifacts or metadata.")
+    print(f"Error details: {e}")
     exit(1)
 
 # ------------------------------------------------------
-# 5️⃣ Metadata load (Firebase or local)
-# ------------------------------------------------------
-try:
-    if db:
-        docs = db.collection("songs").stream()
-        data = [d.to_dict() for d in docs]
-        METADATA = pd.DataFrame(data)
-        METADATA.rename(columns={"title": "track_name", "artist": "artist_name", "url": "track_id"}, inplace=True)
-        print(f"✅ Loaded {len(METADATA)} songs from Firestore.")
-    else:
-        raise Exception("Firestore unavailable")
-except Exception:
-    METADATA = pd.read_csv("SpotifyFeatures.csv")
-    print(f"📁 Loaded {len(METADATA)} songs from local CSV.")
-
-METADATA_COLS_REQUIRED = ["track_id", "track_name", "artist_name"]
-METADATA["track_id"] = METADATA["track_id"].astype(str)
-
-TRACK_TO_CF_INDEX = {track: i for i, track in enumerate(USER_ITEM_MATRIX.columns)}
-CB_INDICES = pd.Series(SCALED_FEATURES.index, index=SCALED_FEATURES["track_id"])
-
-# ------------------------------------------------------
-# 6️⃣ Input schema
+# 5️⃣ Input schema
 # ------------------------------------------------------
 class RecommendationRequest(BaseModel):
     track_id: str
@@ -104,40 +107,70 @@ class RecommendationRequest(BaseModel):
     top_n: int = 10
 
 # ------------------------------------------------------
-# 7️⃣ Recommender logic
+# 6️⃣ Recommendation functions
 # ------------------------------------------------------
 def get_cb_recommendations(track_id, top_n=10):
     if track_id not in CB_INDICES.index:
         return {}
     idx = CB_INDICES[track_id]
-    scores = list(enumerate(CONTENT_SIMILARITY_MATRIX[idx]))
-    scores = sorted(scores, key=lambda x: x[1], reverse=True)[1 : top_n + 1]
-    tracks = SCALED_FEATURES.iloc[[i[0] for i in scores]]["track_id"].tolist()
-    return dict(zip(tracks, [i[1] for i in scores]))
+    sim_scores = list(enumerate(CONTENT_SIMILARITY_MATRIX[idx]))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:top_n + 1]
+    track_indices = [i[0] for i in sim_scores]
+    track_scores = [i[1] for i in sim_scores]
+    cb_tracks = METADATA.iloc[track_indices]['track_id'].tolist()
+    return dict(zip(cb_tracks, track_scores))
+
 
 def get_cf_recommendations(user_id, track_id, top_n=10):
     if user_id not in USER_ITEM_MATRIX.index or track_id not in TRACK_TO_CF_INDEX:
         return {}
-    idx = TRACK_TO_CF_INDEX[track_id]
-    sims = CF_SIMILARITY_MATRIX[idx]
-    pairs = sorted(list(enumerate(sims)), key=lambda x: x[1], reverse=True)[1:]
-    top = pairs[: top_n * 2]
-    tracks = [USER_ITEM_MATRIX.columns[i[0]] for i in top]
-    return dict(zip(tracks, [i[1] for i in top]))
+    track_cf_index = TRACK_TO_CF_INDEX[track_id]
+    sim_scores = CF_SIMILARITY_MATRIX[track_cf_index]
+    sim_scores_paired = sorted(list(enumerate(sim_scores)), key=lambda x: x[1], reverse=True)[1:]
+    top_indices = [i[0] for i in sim_scores_paired[:top_n * 2]]
+    top_scores = [i[1] for i in sim_scores_paired[:top_n * 2]]
+    cf_tracks = [USER_ITEM_MATRIX.columns[idx] for idx in top_indices]
+    return dict(zip(cf_tracks, top_scores))
 
-@app.post("/recommend_hybrid")
-def recommend_hybrid(req: RecommendationRequest):
-    cb = get_cb_recommendations(req.track_id, req.top_n * 2)
-    cf = get_cf_recommendations(req.user_id, req.track_id, req.top_n * 2)
-    df = pd.merge(
-        pd.DataFrame(cb.items(), columns=["track_id", "cb_score"]),
-        pd.DataFrame(cf.items(), columns=["track_id", "cf_score"]),
-        on="track_id", how="outer").fillna(0)
-    df["hybrid_score"] = df["cb_score"] * 0.4 + df["cf_score"] * 0.6
-    df = df[df["track_id"] != req.track_id].sort_values("hybrid_score", ascending=False).head(req.top_n)
-    merged = pd.merge(df, METADATA, on="track_id", how="left")
-    return merged.to_dict(orient="records")
+# ------------------------------------------------------
+# 7️⃣ Hybrid recommendation endpoint
+# ------------------------------------------------------
+@app.post("/recommend_hybrid", response_model=List[Dict[str, Any]])
+def recommend_hybrid(request: RecommendationRequest):
+    cb_scores = get_cb_recommendations(request.track_id, request.top_n * 2)
+    cf_scores = get_cf_recommendations(request.user_id, request.track_id, request.top_n * 2)
 
+    df_cb = pd.DataFrame(list(cb_scores.items()), columns=['track_id', 'cb_score'])
+    df_cf = pd.DataFrame(list(cf_scores.items()), columns=['track_id', 'cf_score'])
+
+    combined_df = pd.merge(df_cb, df_cf, on='track_id', how='outer').fillna(0)
+    combined_df['hybrid_score'] = (combined_df['cb_score'] * 0.4) + (combined_df['cf_score'] * 0.6)
+    final_df = combined_df[combined_df['track_id'] != request.track_id].sort_values(
+        by='hybrid_score', ascending=False
+    ).head(request.top_n)
+
+    result_df = pd.merge(final_df, METADATA, on='track_id', how='left')
+    results = result_df.apply(lambda row: {
+        "track_id": row['track_id'],
+        "track_name": row['track_name'],
+        "artist_name": row['artist_name'],
+        "hybrid_score": round(row['hybrid_score'], 4)
+    }, axis=1).tolist()
+
+    if not results:
+        fallback = METADATA.sample(n=request.top_n, random_state=42)
+        results = fallback.apply(lambda row: {
+            "track_id": row['track_id'],
+            "track_name": row['track_name'],
+            "artist_name": row['artist_name'],
+            "hybrid_score": 0.0
+        }, axis=1).tolist()
+
+    return results
+
+# ------------------------------------------------------
+# 8️⃣ Health check endpoint
+# ------------------------------------------------------
 @app.get("/health")
-def health(): return {"status": "ok", "models": "Hybrid CB+CF from Google Drive"}
-
+def health_check():
+    return {"status": "ok", "models_loaded": "Hybrid CB+CF"}
