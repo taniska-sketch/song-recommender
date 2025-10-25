@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-pandas
-numpy
-joblib
-firebase-admin
-python-dotenv
