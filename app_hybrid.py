@@ -1,8 +1,8 @@
 import os
 import re
 import sys
-import json
 import time
+import json
 import hashlib
 import logging
 import traceback
@@ -19,13 +19,13 @@ from fastapi.middleware.cors import CORSMiddleware
 # Firebase
 from firebase_admin import credentials, firestore, initialize_app as fb_initialize_app
 
-# Optional gdown; we’ll import lazily
-_GDOWN_AVAILABLE = False
+# Try importing gdown for Google Drive downloads
+_GDOWN = False
 try:
-    import gdown  # type: ignore
-    _GDOWN_AVAILABLE = True
+    import gdown
+    _GDOWN = True
 except Exception:
-    _GDOWN_AVAILABLE = False
+    _GDOWN = False
 
 # ---------------- Logging ----------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -46,7 +46,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- Env & Paths ----------------
+# ---------------- Paths ----------------
 MODELS_DIR = os.getenv("MODELS_DIR", "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -57,298 +57,177 @@ ARTIFACT_FILES = {
     "scaler":   os.path.join(MODELS_DIR, "scaler.pkl"),
 }
 
-ENV_KEYS: Dict[str, Tuple[str, ...]] = {
-    "content":  ("CONTENT_SIMILARITY_URL", "CONTENT_SIM_URL"),
-    "cf":       ("CF_SIMILARITY_URL", "ITEM_SIM_CF_URL"),
-    "useritem": ("USER_ITEM_MATRIX_URL", "USERITEM_URL"),
+ENV_KEYS = {
+    "content":  ("CONTENT_SIMILARITY_URL",),
+    "cf":       ("CF_SIMILARITY_URL",),
+    "useritem": ("USER_ITEM_MATRIX_URL",),
     "scaler":   ("SCALER_URL",),
 }
 
-DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "3"))
-FIREBASE_CREDENTIALS_PATH = os.getenv(
-    "FIREBASE_CREDENTIALS_PATH",
-    "/opt/render/project/src/.firebase_key.json"
-)
+FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "/opt/render/project/src/.firebase_key.json")
 HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.5"))
 
-# ---------------- Small utils ----------------
-def sha256_short(path: str, n: int = 12) -> Optional[str]:
-    if not os.path.exists(path):
-        return None
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()[:n]
+# -------- Helpers --------
+def sha256_short(path): return hashlib.sha256(open(path, "rb").read()).hexdigest()[:12] if os.path.exists(path) else None
+def fsize_kb(path): return round(os.path.getsize(path)/1024.0,2) if os.path.exists(path) else None
 
-def fsize_kb(path: str) -> Optional[float]:
-    if not os.path.exists(path):
-        return None
-    return round(os.path.getsize(path) / 1024.0, 2)
-
-def get_env_url(keys: Tuple[str, ...]) -> Optional[str]:
-    for k in keys:
+def env_url(key): 
+    for k in key:
         v = os.getenv(k)
-        if v:
-            return v.strip()
+        if v: return v.strip()
     return None
 
-_DRIVE_ID_RE = re.compile(r"/d/([^/]+)/|id=([^&]+)")
-def parse_drive_id(url: str) -> Optional[str]:
-    m = _DRIVE_ID_RE.search(url)
-    if not m:
-        return None
-    return m.group(1) or m.group(2)
+def parse_drive_id(url):
+    match = re.search(r"/d/([^/]+)/|id=([^&]+)", url)
+    return match.group(1) or match.group(2) if match else None
 
-def drive_direct_url(file_id: str) -> str:
-    # Works for direct HTTP fallback
-    return f"https://drive.google.com/uc?export=download&id={file_id}"
+def drive_direct_url(fid): 
+    return f"https://drive.google.com/uc?export=download&id={fid}"
 
-def looks_like_html(path: str) -> bool:
+def looks_html(file):
     try:
-        with open(path, "rb") as f:
-            head = f.read(256).lower()
-        return b"<html" in head or b"<!doctype html" in head or b"google" in head and b"drive" in head
-    except Exception:
-        return False
+        with open(file,"rb") as f:
+            head=f.read(500).lower()
+        return b"<html" in head
+    except: return False
 
-def download_artifact(url: str, out_path: str, name_for_error: str) -> None:
-    """Download from Google Drive (gdown if present) or direct HTTP.
-       Detects HTML (quota/restricted) and errors clearly."""
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        log.info(f"↪ {name_for_error} already present: {out_path} ({fsize_kb(out_path)} KB, sha256={sha256_short(out_path)})")
+def download_artifact(url, path, label):
+    if os.path.exists(path) and os.path.getsize(path)>0:
         return
-    if not url:
-        raise FileNotFoundError(f"No URL provided for {name_for_error}. Set the env var correctly.")
 
-    last_err = None
-    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+    if not url: raise FileNotFoundError(f"Missing URL for {label}")
+
+    last_err=None
+    for attempt in range(3):
         try:
-            log.info(f"⬇️  Downloading {name_for_error} (attempt {attempt}/{DOWNLOAD_RETRIES})")
-            file_id = parse_drive_id(url)
-            if _GDOWN_AVAILABLE:
-                # gdown handles Drive confirm/virus/quota better
-                gdown.download(url if file_id is None else f"https://drive.google.com/uc?id={file_id}",
-                               out_path, quiet=False, fuzzy=True)
+            fid=parse_drive_id(url)
+            if _GDOWN:
+                gdown.download(url if not fid else drive_direct_url(fid),path,fuzzy=True)
             else:
-                # Fallback direct HTTP
-                dl_url = url if file_id is None else drive_direct_url(file_id)
-                with requests.get(dl_url, stream=True, timeout=90) as r:
+                with requests.get(url if not fid else drive_direct_url(fid),stream=True) as r:
                     r.raise_for_status()
-                    with open(out_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=1 << 20):
-                            if chunk:
-                                f.write(chunk)
+                    with open(path,"wb") as f:
+                        for chunk in r.iter_content(1<<20): f.write(chunk)
 
-            # Sanity checks
-            if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-                raise RuntimeError("Downloaded file is empty.")
-            if looks_like_html(out_path):
-                # Replace vague joblib KeyError: 60 with actionable message
-                with open(out_path, "rb") as f:
-                    sample = f.read(200).decode("utf-8", "ignore")
-                raise RuntimeError(
-                    f"{name_for_error} appears to be an HTML page, not a pickle.\n"
-                    f"Likely causes: Google Drive link is not set to 'Anyone with the link' OR quota exceeded.\n"
-                    f"First 200 bytes:\n{sample}"
-                )
+            if looks_html(path):
+                raise RuntimeError(f"HTML returned for {label}: change Drive sharing to 'Anyone with link'")
 
-            log.info(f"✅ Downloaded {name_for_error}: {out_path} ({fsize_kb(out_path)} KB, sha256={sha256_short(out_path)})")
             return
         except Exception as e:
-            last_err = e
-            log.warning(f"Download failure for {name_for_error}: {e}")
-            if attempt < DOWNLOAD_RETRIES:
-                backoff = 2 ** (attempt - 1)
-                log.info(f"Retrying {name_for_error} in {backoff}s ...")
-                time.sleep(backoff)
-    raise RuntimeError(f"Failed to download {name_for_error} after {DOWNLOAD_RETRIES} attempts. Last error: {last_err}")
+            last_err=e
+            time.sleep(2)
+    raise RuntimeError(f"Download failed for {label}: {last_err}")
 
-def load_pickle(path: str):
-    with open(path, "rb") as f:
-        return joblib.load(f)
+def load_pkl(path): return joblib.load(path)
 
-def _ensure_df(x, name: str) -> pd.DataFrame:
-    if isinstance(x, pd.DataFrame):
-        return x
-    if isinstance(x, np.ndarray):
-        return pd.DataFrame(x)
-    try:
-        return pd.DataFrame(x)
-    except Exception:
-        raise TypeError(f"{name} must be DataFrame/ndarray-like; got {type(x)}")
+def to_df(x,name):
+    if isinstance(x,pd.DataFrame): return x
+    try: return pd.DataFrame(x)
+    except: raise TypeError(f"{name} wrong type")
 
-def _user_vector(useritem: pd.DataFrame, user_id: str) -> Optional[pd.Series]:
-    if user_id in useritem.index:
-        return pd.to_numeric(useritem.loc[user_id], errors="coerce").fillna(0.0)
-    if user_id in useritem.columns:
-        return pd.to_numeric(useritem[user_id], errors="coerce").fillna(0.0)
-    return None
+# -------- Global state --------
+app.state.artifacts={}
+app.state.firebase_ok=False
+app.state.firestore=None
 
-def _stringify_index(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.index = df.index.astype(str)
-    df.columns = df.columns.astype(str)
-    return df
-
-def _apply_scaler(v: np.ndarray, scaler) -> np.ndarray:
-    try:
-        if scaler is not None and hasattr(scaler, "transform"):
-            return scaler.transform(v.reshape(-1, 1)).ravel()
-    except Exception as e:
-        log.warning(f"Scaler transform failed; using raw scores. Reason: {e}")
-    return v
-
-# ---------------- Global state ----------------
-app.state.artifacts: Dict[str, object] = {}
-app.state.firebase_ok: bool = False
-app.state.firestore = None
-
-# ---------------- Startup ----------------
+# -------- Startup --------
 @app.on_event("startup")
 def startup():
-    log.info("🚀 Startup: download → load → Firebase")
+    # Download
+    for k,p in ARTIFACT_FILES.items():
+        download_artifact(env_url(ENV_KEYS[k]),p,k)
 
-    # 1) Downloads
-    env_urls = {k: get_env_url(ENV_KEYS[k]) for k in ARTIFACT_FILES.keys()}
-    for key, path in ARTIFACT_FILES.items():
-        try:
-            download_artifact(env_urls[key], path, name_for_error=f"{key}.pkl")
-        except Exception as e:
-            log.error(f"❌ Download error for {key}: {e}")
-            log.error("Traceback:\n" + traceback.format_exc())
+    # Load
+    loaded={}
+    for k,p in ARTIFACT_FILES.items():
+        loaded[k]=load_pkl(p)
+    app.state.artifacts=loaded
 
-    # 2) Load
-    try:
-        loaded = {}
-        for k, p in ARTIFACT_FILES.items():
-            if not os.path.exists(p):
-                raise FileNotFoundError(f"Missing expected file after download: {p}")
-            obj = load_pickle(p)
-            loaded[k] = obj
-            log.info(f"• Loaded {k}: type={type(obj).__name__}, size={fsize_kb(p)} KB")
-        app.state.artifacts = loaded
-        log.info("✅ All artifacts loaded")
-    except Exception as e:
-        log.error(f"❌ Failed to load model artifacts: {e}")
-        log.error("Traceback:\n" + traceback.format_exc())
-        app.state.artifacts = {}
-
-    # 3) Firebase
+    # Firebase
     try:
         if os.path.exists(FIREBASE_CREDENTIALS_PATH):
-            cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+            cred=credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
             fb_initialize_app(cred)
-            app.state.firestore = firestore.client()
-            app.state.firebase_ok = True
-            log.info("🔥 Firebase initialized (Firestore ready)")
-        else:
-            log.warning(f"Firebase key not found at {FIREBASE_CREDENTIALS_PATH}. Skipping Firebase.")
-    except Exception as e:
-        log.error(f"❌ Firebase init failed: {e}")
-        log.error("Traceback:\n" + traceback.format_exc())
-        app.state.firebase_ok = False
+            app.state.firestore=firestore.client()
+            app.state.firebase_ok=True
+    except: pass
 
-# ---------------- Routes ----------------
+# -------- Routes --------
 @app.get("/")
 def root():
     return {
-        "name": "Hybrid Song Recommender",
-        "version": "1.0",
-        "endpoints": ["/healthz", "/debug/artifacts", "/recommend_hybrid?user_id=U1&top_k=10&alpha=0.5"],
+        "name":"Hybrid Song Recommender",
+        "version":"1.0",
+        "endpoints":[
+            "/healthz",
+            "/debug/artifacts",
+            "/recommend_hybrid?user_id=U1&top_k=10&alpha=0.5",
+            "/debug/users"
+        ],
     }
 
 @app.get("/healthz")
 def healthz():
+    a=app.state.artifacts
     return {
         "ok": True,
-        "artifacts_loaded": bool(app.state.artifacts),
+        "artifacts_loaded": bool(a),
         "firebase_ok": app.state.firebase_ok,
-        "has_content": "content" in app.state.artifacts,
-        "has_cf": "cf" in app.state.artifacts,
-        "has_useritem": "useritem" in app.state.artifacts,
-        "has_scaler": "scaler" in app.state.artifacts,
+        "has_content": "content" in a,
+        "has_cf": "cf" in a,
+        "has_useritem": "useritem" in a,
+        "has_scaler": "scaler" in a,
     }
 
 @app.get("/debug/artifacts")
 def debug_artifacts():
-    info = {}
-    for key, path in ARTIFACT_FILES.items():
-        info[key] = {
-            "exists": os.path.exists(path),
-            "path": path,
-            "size_kb": fsize_kb(path),
-            "sha256_12": sha256_short(path),
-            "env": get_env_url(ENV_KEYS[key]),
+    d={}
+    for k,p in ARTIFACT_FILES.items():
+        d[k]={
+            "exists": os.path.exists(p),
+            "size_kb": fsize_kb(p),
+            "sha256_12": sha256_short(p),
+            "env": env_url(ENV_KEYS[k]),
         }
-    return info
+    return d
+
+# ✅ New Debug Users Route
+@app.get("/debug/users")
+def debug_users(n: int = 25):
+    if not app.state.artifacts or "useritem" not in app.state.artifacts:
+        raise HTTPException(status_code=503, detail="user_item_matrix not loaded")
+    df = to_df(app.state.artifacts["useritem"], "user_item_matrix")
+    return {
+        "total_users": int(df.shape[0]),
+        "row_index_sample": [str(x) for x in df.index.astype(str)[:n]],
+        "column_sample": [str(x) for x in df.columns.astype(str)[:n]],
+    }
 
 @app.get("/recommend_hybrid")
-def recommend_hybrid(
-    user_id: str = Query(...),
-    top_k: int = Query(10, ge=1, le=200),
-    alpha: float = Query(HYBRID_ALPHA, ge=0.0, le=1.0),
-):
-    if not app.state.artifacts:
-        raise HTTPException(status_code=503, detail="Artifacts not loaded")
+def recommend_hybrid(user_id: str, top_k: int = 10, alpha: float = HYBRID_ALPHA):
+    a=app.state.artifacts
+    df_useritem = to_df(a["useritem"],"user_item_matrix")
+    df_cf = to_df(a["cf"],"cf")
+    df_content = to_df(a["content"],"content")
 
-    content = _ensure_df(app.state.artifacts.get("content"), "content_similarity")
-    cf = _ensure_df(app.state.artifacts.get("cf"), "item_similarity_cf_matrix")
-    useritem = _ensure_df(app.state.artifacts.get("useritem"), "user_item_matrix")
-    scaler = app.state.artifacts.get("scaler")
-
-    user_vec = _user_vector(useritem, user_id)
+    user_vec = df_useritem.loc[user_id] if user_id in df_useritem.index else None
     if user_vec is None:
-        raise HTTPException(status_code=404, detail=f"user_id '{user_id}' not found in user_item_matrix")
+        raise HTTPException(status_code=404, detail="user_id not found")
 
-    # Align to similarity matrices
-    content = _stringify_index(content)
-    cf = _stringify_index(cf)
-    user_vec.index = user_vec.index.astype(str)
+    sc = a.get("scaler")
+    u = user_vec.fillna(0)
 
-    # Reindex user vector on matrix items
-    u_on_content = user_vec.reindex(content.index, fill_value=0.0)
-    u_on_cf = user_vec.reindex(cf.index, fill_value=0.0)
+    cf_scores = u.to_numpy().reshape(1,-1) @ df_cf.to_numpy()
+    content_scores = u.to_numpy().reshape(1,-1) @ df_content.to_numpy()
 
-    # Scores
-    c_scores = (u_on_content.to_numpy().reshape(1, -1) @ content.to_numpy()).ravel()
-    f_scores = (u_on_cf.to_numpy().reshape(1, -1) @ cf.to_numpy()).ravel()
+    cf_s = pd.Series(cf_scores.ravel(), index=df_cf.columns)
+    ct_s = pd.Series(content_scores.ravel(), index=df_content.columns)
 
-    c_series = pd.Series(c_scores, index=content.columns, name="content")
-    f_series = pd.Series(f_scores, index=cf.columns, name="cf")
+    hybrid = alpha*ct_s + (1-alpha)*cf_s
+    hybrid[u>0] = -np.inf
 
-    all_items = sorted(set(c_series.index) | set(f_series.index))
-    c_vec = pd.Series(0.0, index=all_items)
-    f_vec = pd.Series(0.0, index=all_items)
-    c_vec.loc[c_series.index] = c_series.values
-    f_vec.loc[f_series.index] = f_series.values
-
-    h_raw = alpha * c_vec.values + (1.0 - alpha) * f_vec.values
-    h = pd.Series(h_raw, index=all_items, name="hybrid_raw")
-
-    # Hide items already interacted with
-    already = user_vec[user_vec > 0].index.astype(str)
-    h.loc[already] = -np.inf
-
-    # Optional scaling
-    h_vals = _apply_scaler(h.replace([-np.inf, np.inf], np.nan).fillna(-1e12).values, scaler)
-    h_scaled = pd.Series(h_vals, index=h.index)
-
-    top = h_scaled.sort_values(ascending=False).head(top_k)
-    results = [{"item_id": k, "score": float(v)} for k, v in top.items() if np.isfinite(v)]
-
-    # Optional Firestore log
-    try:
-        if app.state.firebase_ok and app.state.firestore:
-            app.state.firestore.collection("reco_logs").add({
-                "ts": int(time.time()),
-                "user_id": user_id,
-                "top_k": top_k,
-                "alpha": float(alpha),
-                "count": len(results),
-            })
-    except Exception as e:
-        log.debug(f"Firestore log skipped: {e}")
-
-    return {"user_id": user_id, "alpha": float(alpha), "top_k": top_k, "count": len(results), "results": results}
-
+    top = hybrid.sort_values(ascending=False).head(top_k)
+    return {
+        "user_id": user_id,
+        "results": [{"item_id":i,"score":float(v)} for i,v in top.items() if np.isfinite(v)]
+    }
